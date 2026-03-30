@@ -19,6 +19,58 @@ const API_VERSIONS = ["v1", "v1beta"];
 let resolvedModelId = null;
 let resolvedApiVersion = null;
 
+function normalizeGeminiErrorMessage(message) {
+  return (message || "").toString().trim();
+}
+
+function isLeakedApiKeyError(message) {
+  const haystack = normalizeGeminiErrorMessage(message).toLowerCase();
+  return haystack.includes("reported as leaked");
+}
+
+function isApiNotEnabledError(message) {
+  const haystack = normalizeGeminiErrorMessage(message).toLowerCase();
+  return (
+    haystack.includes("generative language api") &&
+    (haystack.includes("not enabled") || haystack.includes("enable"))
+  );
+}
+
+function isInvalidApiKeyError(message) {
+  const haystack = normalizeGeminiErrorMessage(message).toLowerCase();
+  return haystack.includes("api key not valid") || haystack.includes("invalid api key");
+}
+
+function decorateGeminiError(error) {
+  const rawMessage = normalizeGeminiErrorMessage(error?.message || String(error));
+  if (!rawMessage) {
+    return error;
+  }
+
+  if (isLeakedApiKeyError(rawMessage)) {
+    return new Error(
+      "Gemini API key was disabled (reported as leaked). " +
+        "Create a new key and set it as GEMINI_API_KEY (keep it server-side only)."
+    );
+  }
+
+  if (isApiNotEnabledError(rawMessage)) {
+    return new Error(
+      "Generative Language API is not enabled for this project/key. " +
+        "Enable the API for your Google Cloud/AI Studio project, then try again."
+    );
+  }
+
+  if (isInvalidApiKeyError(rawMessage)) {
+    return new Error(
+      "Gemini API key looks invalid or restricted. " +
+        "Verify GEMINI_API_KEY and ensure it has access to the Generative Language API."
+    );
+  }
+
+  return error;
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -125,11 +177,16 @@ async function callGemini(prompt) {
       if (isModelNotFoundError(message)) {
         continue;
       }
-      throw error;
+      throw decorateGeminiError(error);
     }
   }
 
-  const discovered = await discoverSupportedModel(geminiApiKey);
+  let discovered;
+  try {
+    discovered = await discoverSupportedModel(geminiApiKey);
+  } catch (error) {
+    throw decorateGeminiError(error);
+  }
   if (!discovered) {
     throw new Error(
       "No Gemini models supporting generateContent were found for this API key. " +
@@ -188,7 +245,8 @@ async function generateContent({ apiVersion, modelId, apiKey, text }) {
 
   const payload = await apiResponse.json().catch(() => ({}));
   if (!apiResponse.ok) {
-    throw new Error(payload.error?.message || "Gemini request failed.");
+    const upstream = payload.error?.message || "Gemini request failed.";
+    throw decorateGeminiError(new Error(upstream));
   }
 
   const outputText = payload.candidates?.[0]?.content?.parts
@@ -204,16 +262,26 @@ async function generateContent({ apiVersion, modelId, apiKey, text }) {
 }
 
 async function discoverSupportedModel(apiKey) {
+  let lastError = null;
   for (const apiVersion of API_VERSIONS) {
-    const models = await listModels({ apiVersion, apiKey });
-    if (!models.length) {
+    try {
+      const models = await listModels({ apiVersion, apiKey });
+      if (!models.length) {
+        continue;
+      }
+
+      const pick = pickBestModelId(models);
+      if (pick) {
+        return { apiVersion, modelId: pick };
+      }
+    } catch (error) {
+      lastError = error;
       continue;
     }
+  }
 
-    const pick = pickBestModelId(models);
-    if (pick) {
-      return { apiVersion, modelId: pick };
-    }
+  if (lastError) {
+    throw lastError;
   }
 
   return null;
@@ -224,7 +292,8 @@ async function listModels({ apiVersion, apiKey }) {
   const response = await fetch(url);
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) {
-    return [];
+    const upstream = payload.error?.message || `Gemini listModels failed (HTTP ${response.status}).`;
+    throw decorateGeminiError(new Error(upstream));
   }
 
   return Array.isArray(payload.models) ? payload.models : [];
